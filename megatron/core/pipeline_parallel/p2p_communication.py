@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import operator
+import warnings
 from functools import reduce
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -125,8 +126,13 @@ def _batched_p2p_ops(
     tensor_recv_next: Optional[torch.Tensor],
     group: torch.distributed.ProcessGroup
 ):
+    warnings.warn(f"tensor_send_prev {tensor_send_prev} ")
+    warnings.warn(f"tensor_recv_prev {tensor_send_prev} ")
+    warnings.warn(f"tensor_send_next {tensor_send_prev} ")
+    warnings.warn(f"tensor_recv_next {tensor_send_prev} ")
     ops = []
     if tensor_send_prev is not None:
+        warnings.warn(f"Before send_prev_op=torch.distributed.P2POp ")
         send_prev_op = torch.distributed.P2POp(
             torch.distributed.isend,
             tensor_send_prev,
@@ -135,6 +141,7 @@ def _batched_p2p_ops(
         )
         ops.append(send_prev_op)
     if tensor_recv_prev is not None:
+        warnings.warn(f"Before recv_prev_op=torch.distributed.P2POp ")
         recv_prev_op = torch.distributed.P2POp(
             torch.distributed.irecv,
             tensor_recv_prev,
@@ -143,6 +150,7 @@ def _batched_p2p_ops(
         )
         ops.append(recv_prev_op)
     if tensor_send_next is not None:
+        warnings.warn(f"Before send_next_op=torch.distributed.P2POp ")
         send_next_op = torch.distributed.P2POp(
             torch.distributed.isend,
             tensor_send_next,
@@ -151,6 +159,7 @@ def _batched_p2p_ops(
         )
         ops.append(send_next_op)
     if tensor_recv_next is not None:
+        warnings.warn(f"Before recv_next_op=torch.distributed.P2POp ")
         recv_next_op = torch.distributed.P2POp(
             torch.distributed.irecv,
             tensor_recv_next,
@@ -158,10 +167,13 @@ def _batched_p2p_ops(
             group,
         )
         ops.append(recv_next_op)
+    
+    warnings.warn(f"Before torch.distributed.batch_isend_irecv(ops) len {len(ops)}")
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:
         reqs = []
+    warnings.warn(f"Return reqs[] len = {len(reqs)}")
     return reqs
 
 
@@ -320,12 +332,18 @@ def _communicate(
             return []
 
         p2p_func = _ring_exchange_wrapper
+        warnings.warn(f"p2p_func is _ring_exchange_wrapper ")
+
     elif config.batch_p2p_comm:
         assert wait_on_reqs
         p2p_func = _batched_p2p_ops
+        warnings.warn(f"p2p_func is _batched_p2p_ops ")
+
     else:
         p2p_func = _p2p_ops
+        warnings.warn(f"p2p_func is _p2p_ops ")
 
+    warnings.warn(f"Before p2p_func(...) ")
     reqs = p2p_func(
         tensor_send_prev=tensor_send_prev,
         tensor_recv_prev=tensor_recv_prev,
@@ -333,6 +351,7 @@ def _communicate(
         tensor_recv_next=tensor_recv_next,
         group=get_pipeline_model_parallel_group(),
     )
+    warnings.warn(f"After p2p_func(...) ")
 
     if wait_on_reqs and len(reqs) > 0:
         for req in reqs:
@@ -404,6 +423,7 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
     if not core.parallel_state.is_pipeline_last_stage():
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
+        warnings.warn("Before _communicate(...)")
         _communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
@@ -412,6 +432,7 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
             tensor_shape=None,
             config=config,
         )
+        warnings.warn("After _communicate(...)")
         if config.timers is not None:
             config.timers('forward-send').stop()
 

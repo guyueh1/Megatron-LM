@@ -2,6 +2,7 @@
 
 import contextlib
 from typing import Callable, Iterator, List, Optional, Union
+import warnings
 
 import torch
 from torch.autograd.variable import Variable
@@ -95,10 +96,13 @@ def get_forward_backward_func():
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
+            warnings.warn("Using forward_backward_pipelining_with_interleaving")
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
+            warnings.warn("Using forward_backward_pipelining_without_interleaving")
     else:
         forward_backward_func = forward_backward_no_pipelining
+        warnings.warn("Using forward_backward_no_pipelining")
     return forward_backward_func
 
 
@@ -180,6 +184,8 @@ def forward_step(
         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
     else:
         context_manager = contextlib.nullcontext()
+    
+    warnings.warn("Before forward_step_func")
     with context_manager:
         if checkpoint_activations_microbatch is None:
             output_tensor, loss_func = forward_step_func(data_iterator, model)
@@ -187,6 +193,7 @@ def forward_step(
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
+    warnings.warn("After forward_step_func")
 
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
@@ -212,6 +219,7 @@ def forward_step(
         return [output_tensor, input_tensor[-1]]
     if unwrap_output_tensor:
         return output_tensor
+    warnings.warn(f"Returning output tensor dtype {(output_tensor.dtype)}")
     return [output_tensor]
 
 
@@ -977,6 +985,7 @@ def send_forward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
     for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
+        warnings.warn(f"output_tensor dtype {output_tensor.dtype} tensor_shape {tensor_shape}")
         if tensor_shape is None:
             continue
         p2p_communication.send_forward(output_tensor, config)
@@ -1033,6 +1042,8 @@ def forward_backward_pipelining_without_interleaving(
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
 ):
+    warnings.warn(f"Entering forward_backward_pipelining_without_interleaving")
+
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
 
@@ -1054,6 +1065,7 @@ def forward_backward_pipelining_without_interleaving(
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
+    warnings.warn(f"Model config pipeline_dtype {config.pipeline_dtype}")
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -1078,6 +1090,7 @@ def forward_backward_pipelining_without_interleaving(
             no_sync_context = None
 
     disable_grad_sync()
+    warnings.warn(f"Finish disable_grad_sync()")
 
     # Compute number of warmup microbatches.
     num_warmup_microbatches = (
@@ -1087,6 +1100,8 @@ def forward_backward_pipelining_without_interleaving(
     )
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+
+    warnings.warn(f"Parameters: num_warmup_microbatches {num_warmup_microbatches} num_microbatches_remaining {num_microbatches_remaining}")
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
@@ -1101,8 +1116,11 @@ def forward_backward_pipelining_without_interleaving(
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     model_type = get_model_type(model)
+    warnings.warn(f"Finish get_model_type(model)")
 
     rank = parallel_state.get_pipeline_model_parallel_rank()
+    warnings.warn(f"Finish get_pipeline_model_parallel_rank() rank: {rank}")
+
     recv_tensor_shapes = get_tensor_shapes(
         rank=rank - 1,
         model_type=model_type,
@@ -1140,6 +1158,8 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
+
+        warnings.warn(f"Before forward_step()")
         output_tensor = forward_step(
             forward_step_func,
             data_iterator,
@@ -1151,6 +1171,7 @@ def forward_backward_pipelining_without_interleaving(
             collect_non_loss_data,
             checkpoint_activations_microbatch,
         )
+        # warnings.warn(f"send tensor dtype: {output_tensor[0].dtype}")
         send_forward(output_tensor, send_tensor_shapes, config)
 
         if not forward_only:
@@ -1195,9 +1216,11 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = recv_forward(recv_tensor_shapes, config)
 
         else:
+            # warnings.warn(f"send tensor dtype: {output_tensor[0].dtype}")
             output_tensor_grad = send_forward_recv_backward(
                 output_tensor, send_tensor_shapes, config
             )
+            # warnings.warn(f"received output_tensor_grad tensor dtype: {output_tensor_grad[0].dtype}")
 
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
@@ -1238,11 +1261,13 @@ def forward_backward_pipelining_without_interleaving(
             output_tensor = output_tensors.pop(0)
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
+            # warnings.warn(f"received output_tensor_grad tensor dtype: {output_tensor_grad[0].dtype}")
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
+            # warnings.warn(f"send input_tensor_grad tensor dtype: {input_tensor_grad[0].dtype}")
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
 
     # Launch any remaining grad reductions
