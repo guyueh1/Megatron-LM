@@ -139,6 +139,9 @@ class TransformerLayer(MegatronModule):
                 attention_output_with_bias, residual, self.config.hidden_dropout
             )
 
+        # if parallel_state.get_pipeline_model_parallel_rank() == 0 :
+        #     print(f"Layer: {self.layer_number} Attention checksum {layernorm_input.sum()}")
+
         # Layer norm post the self attention.
         layernorm_output = self.post_self_attn_layernorm(layernorm_input)
 
@@ -155,6 +158,9 @@ class TransformerLayer(MegatronModule):
             output = self.bias_dropout_add_func(
                 mlp_output_with_bias, residual, self.config.hidden_dropout
             )
+        
+        # if parallel_state.get_pipeline_model_parallel_rank() == 0 :
+        #     print(f"Layer: {self.layer_number} MLP checksum {output.sum()}")
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

@@ -16,6 +16,9 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_rank,
 )
 
+# import logging
+# logger = logging.getLogger(__name__)
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -126,13 +129,14 @@ def _batched_p2p_ops(
     tensor_recv_next: Optional[torch.Tensor],
     group: torch.distributed.ProcessGroup
 ):
-    warnings.warn(f"tensor_send_prev {tensor_send_prev} ")
-    warnings.warn(f"tensor_recv_prev {tensor_send_prev} ")
-    warnings.warn(f"tensor_send_next {tensor_send_prev} ")
-    warnings.warn(f"tensor_recv_next {tensor_send_prev} ")
+    # logger.warning(f"rank {rank}" + f"tensor_send_prev {tensor_send_prev} ")
+    # logger.warning(f"rank {rank}" + f"tensor_recv_prev {tensor_send_prev} ")
+    # logger.warning(f"rank {rank}" + f"tensor_send_next {tensor_send_prev} ")
+    # logger.warning(f"rank {rank}" + f"tensor_recv_next {tensor_send_prev} ")
     ops = []
+    # rank = get_pipeline_model_parallel_rank()
     if tensor_send_prev is not None:
-        warnings.warn(f"Before send_prev_op=torch.distributed.P2POp ")
+        # logger.warning(f"rank {rank} " + f"Before send_prev_op=torch.distributed.P2POp ")
         send_prev_op = torch.distributed.P2POp(
             torch.distributed.isend,
             tensor_send_prev,
@@ -141,7 +145,7 @@ def _batched_p2p_ops(
         )
         ops.append(send_prev_op)
     if tensor_recv_prev is not None:
-        warnings.warn(f"Before recv_prev_op=torch.distributed.P2POp ")
+        # logger.warning(f"rank {rank} " + f"Before recv_prev_op=torch.distributed.P2POp tensor_recv_prev shape {tensor_recv_prev.shape} device {tensor_recv_prev.device} dtype {tensor_recv_prev.dtype} from rank {get_pipeline_model_parallel_prev_rank()}")
         recv_prev_op = torch.distributed.P2POp(
             torch.distributed.irecv,
             tensor_recv_prev,
@@ -150,7 +154,7 @@ def _batched_p2p_ops(
         )
         ops.append(recv_prev_op)
     if tensor_send_next is not None:
-        warnings.warn(f"Before send_next_op=torch.distributed.P2POp ")
+        # logger.warning(f"rank {rank} " + f"Before send_next_op=torch.distributed.P2POp tensor_send_next shape {tensor_send_next.shape} device {tensor_send_next.device} dtype {tensor_send_next.dtype} to rank {get_pipeline_model_parallel_next_rank()}")
         send_next_op = torch.distributed.P2POp(
             torch.distributed.isend,
             tensor_send_next,
@@ -159,7 +163,7 @@ def _batched_p2p_ops(
         )
         ops.append(send_next_op)
     if tensor_recv_next is not None:
-        warnings.warn(f"Before recv_next_op=torch.distributed.P2POp ")
+        # logger.warning(f"rank {rank} " + f"Before recv_next_op=torch.distributed.P2POp ")
         recv_next_op = torch.distributed.P2POp(
             torch.distributed.irecv,
             tensor_recv_next,
@@ -168,12 +172,12 @@ def _batched_p2p_ops(
         )
         ops.append(recv_next_op)
     
-    warnings.warn(f"Before torch.distributed.batch_isend_irecv(ops) len {len(ops)}")
+    # logger.warning(f"rank {rank}" + f"Before torch.distributed.batch_isend_irecv(ops) len {len(ops)}")
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:
         reqs = []
-    warnings.warn(f"Return reqs[] len = {len(reqs)}")
+    # logger.warning(f"rank {rank}" + f"Return reqs[] len = {len(reqs)}")
     return reqs
 
 
@@ -332,18 +336,18 @@ def _communicate(
             return []
 
         p2p_func = _ring_exchange_wrapper
-        warnings.warn(f"p2p_func is _ring_exchange_wrapper ")
+        # logger.warning(f"p2p_func is _ring_exchange_wrapper ")
 
     elif config.batch_p2p_comm:
         assert wait_on_reqs
         p2p_func = _batched_p2p_ops
-        warnings.warn(f"p2p_func is _batched_p2p_ops ")
+        # logger.warning(f"p2p_func is _batched_p2p_ops ")
 
     else:
         p2p_func = _p2p_ops
-        warnings.warn(f"p2p_func is _p2p_ops ")
+        # logger.warning(f"p2p_func is _p2p_ops ")
 
-    warnings.warn(f"Before p2p_func(...) ")
+    # logger.warning(f"Rank {get_pipeline_model_parallel_rank()} Before p2p_func(...) ")
     reqs = p2p_func(
         tensor_send_prev=tensor_send_prev,
         tensor_recv_prev=tensor_recv_prev,
@@ -351,7 +355,6 @@ def _communicate(
         tensor_recv_next=tensor_recv_next,
         group=get_pipeline_model_parallel_group(),
     )
-    warnings.warn(f"After p2p_func(...) ")
 
     if wait_on_reqs and len(reqs) > 0:
         for req in reqs:
@@ -363,6 +366,7 @@ def _communicate(
         # User should assert that we have a modern enough PyTorch to not need this
         torch.cuda.synchronize()
 
+    # logger.warning(f"Rank {get_pipeline_model_parallel_rank()} After p2p_func(...) ")
     return tensor_recv_prev, tensor_recv_next, reqs
 
 
@@ -423,7 +427,6 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
     if not core.parallel_state.is_pipeline_last_stage():
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
-        warnings.warn("Before _communicate(...)")
         _communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
@@ -432,7 +435,6 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
             tensor_shape=None,
             config=config,
         )
-        warnings.warn("After _communicate(...)")
         if config.timers is not None:
             config.timers('forward-send').stop()
 

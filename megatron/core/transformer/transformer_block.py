@@ -13,6 +13,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from transformer_engine.pytorch.jit import no_torch_dynamo
 
 
 class TransformerBlock(MegatronModule):
@@ -178,6 +179,7 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    # @no_torch_dynamo
     def forward(self, hidden_states, attention_mask, inference_params=None, rotary_pos_emb=None):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
@@ -253,11 +255,15 @@ class TransformerBlock(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
                     )
+                    # if parallel_state.get_pipeline_model_parallel_rank() == 0 :
+                    #     print(f"Layer: {layer} block checksum {hidden_states.sum()}")
+
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
-
+        # if parallel_state.get_pipeline_model_parallel_rank() == 0 :
+        #     print(f"Final checksum {hidden_states.sum()}")
         return hidden_states
 
     def sharded_state_dict(self, prefix=''):
