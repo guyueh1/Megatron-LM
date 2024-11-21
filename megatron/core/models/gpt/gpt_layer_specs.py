@@ -29,6 +29,7 @@ try:
         TERowParallelGroupedLinear,
         TERowParallelLinear,
         TEActivationOp,
+        TEMLPActivationFp8,
     )
 
     HAVE_TE = True
@@ -211,7 +212,10 @@ def _get_mlp_module_spec(
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     if use_te:
-        activation_func = TEActivationOp
+        if fp8:
+            activation_func = TEMLPActivationFp8
+        else:
+            activation_func = TEActivationOp
     else:
         activation_func = None
     if num_experts is None:

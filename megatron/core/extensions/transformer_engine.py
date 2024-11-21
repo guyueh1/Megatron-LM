@@ -78,6 +78,29 @@ class TEActivationOp:
             'transformer engine. Consider setting use_te_activation_func=False')
         return layer
 
+class TEMLPActivationFp8:
+    def __new__(cls, config: TransformerConfig):
+        activation_op = None
+        if config.gated_linear_unit:
+            if config.activation_func == F.silu:
+                activation_op = te_ops.SwiGLU()
+            elif config.activation_func == F.gelu:
+                activation_op = te_ops.GEGLU()
+            elif config.activation_func == F.silu:
+                activation_op = te_ops.ReGLU()
+        else:
+            if config.activation_func == F.gelu:
+                activation_op = te_ops.GELU()
+            elif config.activation_func == F.silu:
+                activation_op = te_ops.ReLU()
+        if activation_op is None:
+            raise Exception('Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+            'transformer engine. Consider setting use_te_activation_func=False')
+        return te_ops.Sequential(
+            te_ops.Quantize(forward=False, backward=True),
+            activation_op,
+            te_ops.Quantize(forward=True, backward=False)
+        )
 
 class TENorm:
     """
