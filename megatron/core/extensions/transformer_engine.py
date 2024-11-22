@@ -157,8 +157,11 @@ class TELinear(te.pytorch.Linear):
         skip_weight_param_allocation: bool,
         tp_comm_buffer_name: str = None,
         is_expert: bool = False,
+        fp8_dgrad_if_fp8_input: bool = True,
     ):
         self.config = config
+
+        self.fp8_dgrad_if_fp8_input = fp8_dgrad_if_fp8_input
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -257,7 +260,8 @@ class TELinear(te.pytorch.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        out = super().forward(x, is_first_microbatch=_is_first_microbatch, 
+                              fp8_dgrad_if_fp8_input=self.fp8_dgrad_if_fp8_input)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -519,6 +523,7 @@ class TERowParallelLinear(TELinear):
         skip_bias_add: bool,
         is_expert: bool,
         tp_comm_buffer_name: str = None,
+        fp8_dgrad_if_fp8_input: bool = True,
     ):
         if not input_is_parallel:
             raise ValueError(
@@ -540,6 +545,7 @@ class TERowParallelLinear(TELinear):
             skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
+            fp8_dgrad_if_fp8_input=fp8_dgrad_if_fp8_input,
         )
         world_size = get_tensor_model_parallel_world_size()
         rank = get_tensor_model_parallel_rank()

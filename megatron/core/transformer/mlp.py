@@ -95,6 +95,7 @@ class MLP(MegatronModule):
             skip_bias_add=True,
             is_expert=is_expert,
             tp_comm_buffer_name='fc2',
+            fp8_dgrad_if_fp8_input=False,
         )
 
     def forward(self, hidden_states):
