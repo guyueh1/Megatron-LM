@@ -30,7 +30,7 @@ from megatron.core.utils import deprecate_inference_params
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-except ImportError:
+except:
     selective_state_update = None
 
 try:
@@ -45,7 +45,7 @@ try:
         mamba_chunk_scan_combined,
         mamba_split_conv1d_scan_combined,
     )
-except ImportError:
+except:
     raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
 
 try:
