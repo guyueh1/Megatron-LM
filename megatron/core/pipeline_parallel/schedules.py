@@ -521,6 +521,16 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def _log_memory_usage(reporting_msg: str):
+    """Log memory usage."""
+    if torch.distributed.get_rank() == 0:
+        print(f">>>>> Reporting memory usage at: {reporting_msg} <<<<<<")
+        print(f"Current memory usage: {torch.cuda.memory_allocated() / 1024**2} MB")
+        print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024**2} MB")
+        print(f"Current memory reserved: {torch.cuda.memory_reserved() / 1024**2} MB")
+        print(f"Peak memory reserved: {torch.cuda.max_memory_reserved() / 1024**2} MB")
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -602,6 +612,7 @@ def forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
+        _log_memory_usage(f"Before combined_1f1b_schedule_for_no_pipelining")
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
             forward_step_func,
             data_iterator,
@@ -618,7 +629,9 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
         )
+        _log_memory_usage(f"After combined_1f1b_schedule_for_no_pipelining")
     elif config.hybrid_context_parallel:
+        _log_memory_usage(f"Before hybrid_context_parallel_forward_backward")
         forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
             forward_step_func,
             data_iterator,
@@ -636,7 +649,9 @@ def forward_backward_no_pipelining(
             check_first_val_step,
             model_type,
         )
+        _log_memory_usage(f"After hybrid_context_parallel_forward_backward")
     else:
+        _log_memory_usage(f"Before forward-backward pass")
         with no_sync_func():
             for i in range(num_microbatches - 1):
                 output_tensor, num_tokens = forward_step(
@@ -659,6 +674,7 @@ def forward_backward_no_pipelining(
                     )
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
+        _log_memory_usage(f"Before forward step {num_microbatches - 1}")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -674,12 +690,13 @@ def forward_backward_no_pipelining(
             ),
             current_microbatch=num_microbatches - 1,
         )
-
+        _log_memory_usage(f"After forward step {num_microbatches - 1}")
         total_num_tokens += num_tokens
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-
+        _log_memory_usage(f"After backward step {num_microbatches - 1}")
+    _log_memory_usage(f"Before finalize model grads")
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
@@ -689,6 +706,7 @@ def forward_backward_no_pipelining(
             pg_collection=pg_collection,
             force_all_reduce=force_all_reduce,
         )
+    _log_memory_usage(f"After finalize model grads")
 
     if not forward_only and config.fine_grained_activation_offloading:
         off_interface.reset()
