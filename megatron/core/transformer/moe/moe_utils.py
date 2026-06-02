@@ -1349,6 +1349,11 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     # CUTLASS kernel for grouped GEMM assumes 256 alignment.
     if config.use_transformer_engine_op_fuser:
         return 256
+    if (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+    ):
+        return 128
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:
