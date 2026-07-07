@@ -767,6 +767,7 @@ def process_mtp_loss(
     is_training: bool,
     compute_language_model_loss: Callable,
     config: TransformerConfig,
+    compute_language_model_loss_from_hidden_states: Optional[Callable] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
@@ -787,6 +788,8 @@ def process_mtp_loss(
         runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
         is_training (bool): Whether the model is in training mode.
         compute_language_model_loss (Callable): Method to compute language model loss.
+        compute_language_model_loss_from_hidden_states (Optional[Callable]): Optional method that
+            can project only non-masked hidden states before computing loss.
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
         tp_group (Optional[ProcessGroup]): Tensor parallelism process group.
@@ -838,13 +841,6 @@ def process_mtp_loss(
     original_num_tokens = loss_mask.sum()
 
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        if scale_logits_fn is not None:
-            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
@@ -852,7 +848,30 @@ def process_mtp_loss(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        if compute_language_model_loss_from_hidden_states is not None:
+            mtp_loss, mtp_logits, mtp_labels_for_log, loss_mask_for_log = (
+                compute_language_model_loss_from_hidden_states(
+                    hidden_states=hidden_states_list[mtp_layer_number + 1],
+                    labels=mtp_labels,
+                    loss_mask=loss_mask,
+                    output_layer=output_layer,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                    scale_logits_fn=scale_logits_fn,
+                    return_logits=True,
+                )
+            )
+        else:
+            mtp_logits, _ = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            if scale_logits_fn is not None:
+                mtp_logits = scale_logits_fn(mtp_logits)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+            mtp_labels_for_log = mtp_labels
+            loss_mask_for_log = loss_mask
 
         mtp_loss = loss_mask * mtp_loss
 
@@ -860,9 +879,18 @@ def process_mtp_loss(
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, mtp_labels, loss_mask, output_layer, runtime_gather_output, tp_group
-            )
+            if loss_mask_for_log.count_nonzero().item() == 0:
+                correct = torch.zeros((), dtype=torch.float32, device=mtp_loss.device)
+                total = torch.zeros((), dtype=torch.float32, device=mtp_loss.device)
+            else:
+                correct, total = _compute_mtp_acceptance_counts(
+                    mtp_logits,
+                    mtp_labels_for_log,
+                    loss_mask_for_log,
+                    output_layer,
+                    runtime_gather_output,
+                    tp_group,
+                )
 
             MTPLossLoggingHelper.save_metrics_to_tracker(
                 mtp_loss_for_log,

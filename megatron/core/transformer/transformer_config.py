@@ -87,6 +87,12 @@ class TransformerConfig(ModelParallelConfig):
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
 
+    skip_masked_token_output_projection: bool = False
+    """If True, compute the LM output projection and cross entropy only for positions with a
+    non-zero loss mask when labels and loss_mask are available. This is mathematically equivalent
+    to dense projection for masked-loss training, but avoids vocab GEMM and CE work for masked
+    output positions. Unsupported output-head modes fall back to the dense path."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.

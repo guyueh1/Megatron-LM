@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -187,6 +187,197 @@ class LanguageModule(MegatronModule):
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
         return loss
+
+    def compute_language_model_loss_from_hidden_states(
+        self,
+        hidden_states: Tensor,
+        labels: Tensor,
+        loss_mask: Optional[Tensor],
+        output_layer: Callable,
+        output_weight: Optional[Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+        scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
+        return_logits: bool = False,
+    ):
+        """Compute LM loss from hidden states, optionally skipping masked output positions.
+
+        When ``skip_masked_token_output_projection`` is enabled and supported for the current
+        output-head mode, the vocab projection and cross entropy run only on positions whose
+        loss mask is non-zero. The returned loss keeps the standard dense ``[batch, sequence]``
+        shape with zeros at skipped positions, so existing downstream loss reduction can still
+        apply ``loss_mask`` normally.
+        """
+        sparse_result = self._compute_sparse_language_model_loss_from_hidden_states(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            scale_logits_fn=scale_logits_fn,
+            return_logits=return_logits,
+        )
+        if sparse_result is not None:
+            return sparse_result
+
+        logits, _ = output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        if scale_logits_fn is not None:
+            logits = scale_logits_fn(logits)
+        loss = self.compute_language_model_loss(labels, logits)
+        if return_logits:
+            return loss, logits, labels, loss_mask
+        return loss
+
+    def _compute_sparse_language_model_loss_from_hidden_states(
+        self,
+        hidden_states: Tensor,
+        labels: Tensor,
+        loss_mask: Optional[Tensor],
+        output_layer: Callable,
+        output_weight: Optional[Tensor],
+        runtime_gather_output: Optional[bool],
+        scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
+        return_logits: bool,
+    ):
+        if not getattr(self.config, "skip_masked_token_output_projection", False):
+            return None
+        if labels is None or loss_mask is None:
+            return None
+        if getattr(self.config, "defer_embedding_wgrad_compute", False):
+            return None
+        if getattr(self.config, "_cpu_offloading_context", None) is not None:
+            if self.config._cpu_offloading_context.inside_context is True:
+                return None
+
+        gather_output = (
+            runtime_gather_output
+            if runtime_gather_output is not None
+            else getattr(output_layer, "gather_output", False)
+        )
+        if gather_output:
+            return None
+
+        if not hasattr(output_layer, "_forward_impl"):
+            return None
+
+        weight = output_weight if output_weight is not None else getattr(output_layer, "weight", None)
+        if weight is None:
+            return None
+
+        tp_group = getattr(output_layer, "tp_group", self.tp_group)
+        uses_sequence_parallel = getattr(output_layer, "sequence_parallel", False)
+        hidden_states_for_projection = hidden_states
+        if uses_sequence_parallel:
+            hidden_states_for_projection = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=True, group=tp_group
+            )
+
+        sequence_length, batch_size, hidden_size = hidden_states_for_projection.shape
+        if labels.shape != (batch_size, sequence_length):
+            return None
+        if loss_mask.shape != (batch_size, sequence_length):
+            return None
+
+        loss_mask_by_sequence = loss_mask.transpose(0, 1).contiguous()
+        active_mask = loss_mask_by_sequence.reshape(-1) != 0
+        active_indices = active_mask.nonzero(as_tuple=False).view(-1)
+        num_positions = sequence_length * batch_size
+        active_count = active_indices.numel()
+
+        if active_count == num_positions:
+            return None
+
+        labels_by_sequence = labels.transpose(0, 1).contiguous()
+        flat_labels = labels_by_sequence.reshape(-1)
+        flat_loss_mask = loss_mask_by_sequence.reshape(-1)
+
+        if active_count == 0:
+            zero = hidden_states.sum() * 0.0
+            loss = (hidden_states.new_zeros((batch_size, sequence_length)) + zero).contiguous()
+            if return_logits:
+                logits = hidden_states.new_empty((0, 1, weight.size(0)))
+                active_labels = flat_labels.new_empty((1, 0))
+                active_loss_mask = flat_loss_mask.new_empty((1, 0))
+                return loss, logits, active_labels, active_loss_mask
+            return loss
+
+        flat_hidden_states = hidden_states_for_projection.contiguous().view(
+            num_positions, hidden_size
+        )
+        active_hidden_states = flat_hidden_states.index_select(0, active_indices).view(
+            active_count, 1, hidden_size
+        )
+        active_labels = flat_labels.index_select(0, active_indices).view(1, active_count)
+        active_loss_mask = flat_loss_mask.index_select(0, active_indices).view(1, active_count)
+
+        logits = self._compute_active_language_model_logits(
+            active_hidden_states=active_hidden_states,
+            output_layer=output_layer,
+            weight=weight,
+            sequence_parallel_input_gathered=uses_sequence_parallel,
+        )
+        if scale_logits_fn is not None:
+            logits = scale_logits_fn(logits)
+
+        active_loss = self.compute_language_model_loss(active_labels, logits).reshape(-1)
+        flat_loss = active_loss.new_zeros(num_positions)
+        flat_loss = flat_loss.scatter(0, active_indices, active_loss)
+        loss = flat_loss.view(sequence_length, batch_size).transpose(0, 1).contiguous()
+
+        if return_logits:
+            return loss, logits, active_labels, active_loss_mask
+        return loss
+
+    def _compute_active_language_model_logits(
+        self,
+        active_hidden_states: Tensor,
+        output_layer: Callable,
+        weight: Tensor,
+        sequence_parallel_input_gathered: bool,
+    ) -> Tensor:
+        """Project active hidden states with the LM head while preserving TP autograd behavior."""
+        bias = getattr(output_layer, "bias", None)
+        if getattr(output_layer, "skip_bias_add", False):
+            bias = None
+
+        if sequence_parallel_input_gathered:
+            input_parallel = active_hidden_states
+            allreduce_dgrad = False
+            sequence_parallel = False
+        else:
+            if (
+                getattr(output_layer, "allreduce_dgrad", False)
+                or getattr(output_layer, "sequence_parallel", False)
+                or getattr(output_layer, "explicit_expert_comm", False)
+                or getattr(output_layer, "disable_grad_reduce", False)
+            ):
+                input_parallel = active_hidden_states
+            else:
+                input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(
+                    active_hidden_states, group=getattr(output_layer, "tp_group", self.tp_group)
+                )
+            allreduce_dgrad = (
+                False
+                if getattr(output_layer, "explicit_expert_comm", False)
+                else getattr(output_layer, "allreduce_dgrad", False)
+            )
+            sequence_parallel = False
+
+        return output_layer._forward_impl(
+            input=input_parallel,
+            weight=weight,
+            bias=bias,
+            gradient_accumulation_fusion=getattr(
+                output_layer, "gradient_accumulation_fusion", False
+            ),
+            allreduce_dgrad=allreduce_dgrad,
+            sequence_parallel=sequence_parallel,
+            grad_output_buffer=None,
+            wgrad_deferral_limit=None,
+            tp_group=getattr(output_layer, "tp_group", self.tp_group),
+        )
 
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.

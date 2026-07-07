@@ -696,6 +696,9 @@ class GPTModel(LanguageModule):
                     runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
+                    compute_language_model_loss_from_hidden_states=(
+                        self.compute_language_model_loss_from_hidden_states
+                    ),
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     tp_group=self.tp_group,
@@ -747,6 +750,26 @@ class GPTModel(LanguageModule):
                 # then back to [S’, B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        if labels is not None and not has_config_logger_enabled(self.config):
+            loss = self.compute_language_model_loss_from_hidden_states(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                scale_logits_fn=self._scale_logits,
+            )
+            # Restore sequence parallel execution to the output layer if necessary.
+            if sequence_parallel_override:
+                assert (
+                    in_inference_mode
+                    and inference_context.is_dynamic_batching()
+                    and inference_context.config.materialize_only_last_token_logits
+                )
+                self.output_layer.sequence_parallel = True
+            return loss
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
