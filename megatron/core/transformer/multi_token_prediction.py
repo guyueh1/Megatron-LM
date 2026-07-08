@@ -859,6 +859,7 @@ def process_mtp_loss(
                     runtime_gather_output=runtime_gather_output,
                     scale_logits_fn=scale_logits_fn,
                     return_logits=True,
+                    cp_group=cp_group,
                 )
             )
         else:

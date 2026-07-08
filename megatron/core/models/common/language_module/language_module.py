@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -198,6 +198,7 @@ class LanguageModule(MegatronModule):
         runtime_gather_output: Optional[bool] = None,
         scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
         return_logits: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Compute LM loss from hidden states, optionally skipping masked output positions.
 
@@ -216,6 +217,7 @@ class LanguageModule(MegatronModule):
             runtime_gather_output=runtime_gather_output,
             scale_logits_fn=scale_logits_fn,
             return_logits=return_logits,
+            cp_group=cp_group,
         )
         if sparse_result is not None:
             return sparse_result
@@ -240,6 +242,7 @@ class LanguageModule(MegatronModule):
         runtime_gather_output: Optional[bool],
         scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
         return_logits: bool,
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ):
         if not getattr(self.config, "skip_masked_token_output_projection", False):
             return None
@@ -286,15 +289,42 @@ class LanguageModule(MegatronModule):
         num_positions = sequence_length * batch_size
         active_count = active_indices.numel()
 
-        if active_count == num_positions:
-            return None
-
         labels_by_sequence = labels.transpose(0, 1).contiguous()
         flat_labels = labels_by_sequence.reshape(-1)
         flat_loss_mask = loss_mask_by_sequence.reshape(-1)
 
+        flat_hidden_states = hidden_states_for_projection.contiguous().view(
+            num_positions, hidden_size
+        )
+        active_hidden_states = flat_hidden_states.index_select(0, active_indices)
+        active_labels = flat_labels.index_select(0, active_indices)
+        active_loss_mask = flat_loss_mask.index_select(0, active_indices)
+
+        cp_balanced_result = self._compute_cp_balanced_sparse_language_model_loss(
+            hidden_states=hidden_states,
+            active_hidden_states=active_hidden_states,
+            active_labels=active_labels,
+            active_loss_mask=active_loss_mask,
+            active_indices=active_indices,
+            active_count=active_count,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            num_positions=num_positions,
+            output_layer=output_layer,
+            weight=weight,
+            uses_sequence_parallel=uses_sequence_parallel,
+            scale_logits_fn=scale_logits_fn,
+            return_logits=return_logits,
+            cp_group=cp_group,
+        )
+        if cp_balanced_result is not None:
+            return cp_balanced_result
+
+        if active_count == num_positions:
+            return None
+
         if active_count == 0:
-            zero = hidden_states.sum() * 0.0
+            zero = hidden_states.sum() * 0.0 + weight.sum() * 0.0
             loss = (hidden_states.new_zeros((batch_size, sequence_length)) + zero).contiguous()
             if return_logits:
                 logits = hidden_states.new_empty((0, 1, weight.size(0)))
@@ -303,17 +333,8 @@ class LanguageModule(MegatronModule):
                 return loss, logits, active_labels, active_loss_mask
             return loss
 
-        flat_hidden_states = hidden_states_for_projection.contiguous().view(
-            num_positions, hidden_size
-        )
-        active_hidden_states = flat_hidden_states.index_select(0, active_indices).view(
-            active_count, 1, hidden_size
-        )
-        active_labels = flat_labels.index_select(0, active_indices).view(1, active_count)
-        active_loss_mask = flat_loss_mask.index_select(0, active_indices).view(1, active_count)
-
         logits = self._compute_active_language_model_logits(
-            active_hidden_states=active_hidden_states,
+            active_hidden_states=active_hidden_states.view(active_count, 1, hidden_size),
             output_layer=output_layer,
             weight=weight,
             sequence_parallel_input_gathered=uses_sequence_parallel,
@@ -321,13 +342,15 @@ class LanguageModule(MegatronModule):
         if scale_logits_fn is not None:
             logits = scale_logits_fn(logits)
 
-        active_loss = self.compute_language_model_loss(active_labels, logits).reshape(-1)
+        active_labels_for_loss = active_labels.view(1, active_count)
+        active_loss_mask_for_log = active_loss_mask.view(1, active_count)
+        active_loss = self.compute_language_model_loss(active_labels_for_loss, logits).reshape(-1)
         flat_loss = active_loss.new_zeros(num_positions)
         flat_loss = flat_loss.scatter(0, active_indices, active_loss)
         loss = flat_loss.view(sequence_length, batch_size).transpose(0, 1).contiguous()
 
         if return_logits:
-            return loss, logits, active_labels, active_loss_mask
+            return loss, logits, active_labels_for_loss, active_loss_mask_for_log
         return loss
 
     def _compute_active_language_model_logits(
@@ -378,6 +401,154 @@ class LanguageModule(MegatronModule):
             wgrad_deferral_limit=None,
             tp_group=getattr(output_layer, "tp_group", self.tp_group),
         )
+
+    def _compute_cp_balanced_sparse_language_model_loss(
+        self,
+        hidden_states: Tensor,
+        active_hidden_states: Tensor,
+        active_labels: Tensor,
+        active_loss_mask: Tensor,
+        active_indices: Tensor,
+        active_count: int,
+        batch_size: int,
+        sequence_length: int,
+        num_positions: int,
+        output_layer: Callable,
+        weight: Tensor,
+        uses_sequence_parallel: bool,
+        scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
+        return_logits: bool,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ):
+        if not getattr(
+            self.config, "balance_masked_token_output_projection_across_cp", False
+        ):
+            return None
+        if cp_group is None or not torch.distributed.is_initialized():
+            return None
+        cp_size = cp_group.size()
+        if cp_size == 1:
+            return None
+
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        count = torch.tensor([active_count], dtype=torch.int64, device=hidden_states.device)
+        gathered_counts = [torch.empty_like(count) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered_counts, count, group=cp_group)
+        active_counts = [int(gathered_count.item()) for gathered_count in gathered_counts]
+        global_active_count = sum(active_counts)
+
+        if global_active_count == 0:
+            zero = hidden_states.sum() * 0.0 + weight.sum() * 0.0
+            loss = (hidden_states.new_zeros((batch_size, sequence_length)) + zero).contiguous()
+            if return_logits:
+                logits = hidden_states.new_empty((0, 1, weight.size(0)))
+                labels = active_labels.new_empty((1, 0))
+                loss_mask = active_loss_mask.new_empty((1, 0))
+                return loss, logits, labels, loss_mask
+            return loss
+
+        if global_active_count == cp_size * num_positions:
+            return None
+
+        send_counts, recv_counts = self._get_cp_balanced_active_token_splits(
+            active_counts, cp_rank
+        )
+
+        balanced_hidden_states = tensor_parallel.all_to_all(
+            cp_group,
+            active_hidden_states,
+            output_split_sizes_=recv_counts,
+            input_split_sizes=send_counts,
+        )
+        balanced_labels = tensor_parallel.all_to_all(
+            cp_group,
+            active_labels,
+            output_split_sizes_=recv_counts,
+            input_split_sizes=send_counts,
+        )
+        balanced_loss_mask = tensor_parallel.all_to_all(
+            cp_group,
+            active_loss_mask,
+            output_split_sizes_=recv_counts,
+            input_split_sizes=send_counts,
+        )
+
+        balanced_count = balanced_hidden_states.shape[0]
+        if balanced_count == 0:
+            balanced_active_loss = hidden_states.new_empty((0,))
+            logits = hidden_states.new_empty((0, 1, weight.size(0)))
+            balanced_labels_for_loss = balanced_labels.view(1, 0)
+            balanced_loss_mask_for_log = balanced_loss_mask.view(1, 0)
+        else:
+            logits = self._compute_active_language_model_logits(
+                active_hidden_states=balanced_hidden_states.view(
+                    balanced_count, 1, balanced_hidden_states.shape[-1]
+                ),
+                output_layer=output_layer,
+                weight=weight,
+                sequence_parallel_input_gathered=uses_sequence_parallel,
+            )
+            if scale_logits_fn is not None:
+                logits = scale_logits_fn(logits)
+            balanced_labels_for_loss = balanced_labels.view(1, balanced_count)
+            balanced_loss_mask_for_log = balanced_loss_mask.view(1, balanced_count)
+            balanced_active_loss = self.compute_language_model_loss(
+                balanced_labels_for_loss, logits
+            ).reshape(-1)
+
+        local_active_loss = tensor_parallel.all_to_all(
+            cp_group,
+            balanced_active_loss,
+            output_split_sizes_=send_counts,
+            input_split_sizes=recv_counts,
+        )
+        zero = (
+            hidden_states.sum() * 0.0
+            + weight.sum() * 0.0
+            + balanced_hidden_states.sum() * 0.0
+            + local_active_loss.sum() * 0.0
+        )
+        flat_loss = local_active_loss.new_zeros(num_positions) + zero
+        if active_count > 0:
+            flat_loss = flat_loss.scatter(0, active_indices, local_active_loss)
+        loss = flat_loss.view(sequence_length, batch_size).transpose(0, 1).contiguous()
+
+        if return_logits:
+            return loss, logits, balanced_labels_for_loss, balanced_loss_mask_for_log
+        return loss
+
+    @staticmethod
+    def _get_cp_balanced_active_token_splits(
+        active_counts: List[int], cp_rank: int
+    ) -> Tuple[List[int], List[int]]:
+        cp_size = len(active_counts)
+        global_active_count = sum(active_counts)
+        base_target_count, extra = divmod(global_active_count, cp_size)
+        target_counts = [
+            base_target_count + (1 if rank < extra else 0) for rank in range(cp_size)
+        ]
+
+        source_offsets = [0]
+        target_offsets = [0]
+        for count in active_counts:
+            source_offsets.append(source_offsets[-1] + count)
+        for count in target_counts:
+            target_offsets.append(target_offsets[-1] + count)
+
+        exchange_counts = []
+        for source_rank in range(cp_size):
+            source_start = source_offsets[source_rank]
+            source_end = source_offsets[source_rank + 1]
+            row = []
+            for target_rank in range(cp_size):
+                target_start = target_offsets[target_rank]
+                target_end = target_offsets[target_rank + 1]
+                row.append(max(0, min(source_end, target_end) - max(source_start, target_start)))
+            exchange_counts.append(row)
+
+        send_counts = exchange_counts[cp_rank]
+        recv_counts = [exchange_counts[source_rank][cp_rank] for source_rank in range(cp_size)]
+        return send_counts, recv_counts
 
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.

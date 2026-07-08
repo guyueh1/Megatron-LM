@@ -760,6 +760,7 @@ class GPTModel(LanguageModule):
                 output_weight=output_weight,
                 runtime_gather_output=runtime_gather_output,
                 scale_logits_fn=self._scale_logits,
+                cp_group=self.pg_collection.cp,
             )
             # Restore sequence parallel execution to the output layer if necessary.
             if sequence_parallel_override:

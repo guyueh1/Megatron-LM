@@ -32,10 +32,17 @@ class SparseLMHeadHarness:
         LanguageModule._compute_sparse_language_model_loss_from_hidden_states
     )
     _compute_active_language_model_logits = LanguageModule._compute_active_language_model_logits
+    _compute_cp_balanced_sparse_language_model_loss = (
+        LanguageModule._compute_cp_balanced_sparse_language_model_loss
+    )
+    _get_cp_balanced_active_token_splits = staticmethod(
+        LanguageModule._get_cp_balanced_active_token_splits
+    )
 
     def __init__(self, skip_masked_token_output_projection: bool):
         self.config = SimpleNamespace(
             skip_masked_token_output_projection=skip_masked_token_output_projection,
+            balance_masked_token_output_projection_across_cp=False,
             defer_embedding_wgrad_compute=False,
             _cpu_offloading_context=None,
         )

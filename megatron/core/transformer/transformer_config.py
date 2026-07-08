@@ -93,6 +93,11 @@ class TransformerConfig(ModelParallelConfig):
     to dense projection for masked-loss training, but avoids vocab GEMM and CE work for masked
     output positions. Unsupported output-head modes fall back to the dense path."""
 
+    balance_masked_token_output_projection_across_cp: bool = False
+    """If True with ``skip_masked_token_output_projection`` and context parallelism, redistribute
+    active loss tokens across CP ranks before the LM output projection. This balances imbalanced
+    SFT masks whose active labels are concentrated on a subset of CP sequence shards."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
